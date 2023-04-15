@@ -2,14 +2,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_sparse import spmm
+# from torch_sparse import spmm
 from sparsemax import Sparsemax
 
 
 class GraphAttentionLayer(nn.Module):
     def __init__(self, in_features, out_features, dropout, alpha, concat=True):
         super(GraphAttentionLayer, self).__init__()
-
         self.in_features = in_features
         self.out_features = out_features
         self.alpha = alpha
@@ -17,7 +16,6 @@ class GraphAttentionLayer(nn.Module):
 
         self.W = nn.Parameter(torch.empty(size=(in_features, out_features)))
         nn.init.xavier_uniform_(self.W.data, gain=1.414)
-
         self.a = nn.Parameter(torch.empty(size=(2*out_features, 1)))
         nn.init.xavier_uniform_(self.a.data, gain=1.414)
 
@@ -123,6 +121,14 @@ class SpGraphAttentionLayer(nn.Module):
         del input
         # h: N x out
 
+        # # Self-attention on the nodes - Shared attention mechanism
+        # edge_h = torch.cat((h[edge[0, :], :], h[edge[1, :], :]), dim=1).t()
+        # # edge: 2*D x E
+
+        # edge_e = self.leakyrelu(self.a.mm(edge_h).squeeze())
+        # del edge_h
+        # # edge_e: E
+
         edge_h1 = torch.matmul(self.a[:, :self.out_features], h.t()).squeeze()
         edge_h2 = torch.matmul(self.a[:, self.out_features:], h.t()).squeeze()
         # edge_h1: N, edge_h2: N
@@ -134,12 +140,21 @@ class SpGraphAttentionLayer(nn.Module):
         del edge_h2
 
         e_rowsum = self.special_spmm(edge, edge_e, torch.Size([N, N]), torch.ones(size=(N,1), device=dv))
+        # e_rowsum: N x 1
 
+        # e = torch.sparse_coo_tensor(edge, edge_e, torch.Size([N, N]))
+        # del edge_e
+        # attention = torch.sparse.softmax(e, dim=1)
+        # del e
+        
+        # h_prime = torch.sparse.mm(attention, h)
+        # h_prime = spmm(edge, attention.coalesce().values(), N, N, h)
         h_prime = self.special_spmm(edge, edge_e, torch.Size([N, N]), h)
         assert not torch.isnan(h_prime).any()
         del edge_e
         # h_prime: N x out
         del edge
+        # del attention
         del h
 
         h_prime = h_prime.div(e_rowsum)

@@ -15,15 +15,16 @@ from tqdm import tqdm
 import copy
 import random
 
+
 # Training settings
 parser = argparse.ArgumentParser()
-parser.add_argument('--dataset', type=str, default='MELD', help='Dataset to be used.')
+parser.add_argument('--dataset', type=str, default='MELD', help='Dataset to be used.') # MELD, MEISD, MSED
 parser.add_argument('--task', type=str, default='s+e', help='\'s\' for sentiment, \'e\' for emotion, \'s+e\' for multi-task learning.')
 parser.add_argument('--mode', type=str, default='t+v', help='\'t\' for text, \'v\' for video, \'t+v\' for multi-modal learning.')
-parser.add_argument("--epoch", type=int, default=50)
-parser.add_argument("--batch_size", type=int, default=2)
-parser.add_argument("--bert_lr", type=float, default=4e-7, help='Learning rate for bert fine-tuning.')
-parser.add_argument("--lr", type=float, default=3e-6, help='Learning rate.')
+parser.add_argument("--epoch", type=int, default=50) # 50, 100, 50
+parser.add_argument("--batch_size", type=int, default=2) # 2, 2, 16
+parser.add_argument("--bert_lr", type=float, default=4e-7, help='Learning rate for bert fine-tuning.') # 4e-7, 4e-7, 1e-5
+parser.add_argument("--lr", type=float, default=3e-6, help='Learning rate.') # 3e-6, 3e-6, 1e-5
 parser.add_argument("--max_grad", type=float, default=10.0)
 parser.add_argument("--dropout", type=float, default=0.5)
 parser.add_argument("--hidden_dim", type=int, default=768)
@@ -32,14 +33,13 @@ parser.add_argument('--nheads', type=int, default=8, help='Number of head attent
 parser.add_argument('--nlayers_TE', type=int, default=1, help='Number of GAT layers in TextEncoder.')
 parser.add_argument('--nlayers_IE', type=int, default=1, help='Number of GAT layers in ImageEncoder.')
 parser.add_argument('--nlayers_MTI', type=int, default=1, help='Number of GAT layers in Speaker-Aware Multi-Task Interactive Conversation Graph.')
-parser.add_argument('--z', type=int, default=3, help='Window size for connection in Speaker-Aware Multi-Task Interactive Conversation Graph.')
+parser.add_argument('--z', type=int, default=3, help='Window size for connection in Speaker-Aware Multi-Task Interactive Conversation Graph.') # 3
 parser.add_argument('--sen_class', type=int, default=3)
-parser.add_argument('--emo_class', type=int, default=7)
+parser.add_argument('--emo_class', type=int, default=7) # 7, 9, 6
 parser.add_argument('--num_workers', type=int, default=4)
 parser.add_argument('--scheduler_factor', type=float, default=0.1)
 parser.add_argument('--scheduler_patience', type=int, default=8)
 parser.add_argument('--accumulation_steps', type=int, default=4)
-parser.add_argument('--seed', type=int, default=9)
 args = parser.parse_args()
 
 
@@ -74,8 +74,12 @@ def evaluate(model, data_loader, job_embedding, sex_embedding, personality_embed
     emo_labels_all = np.array([], dtype=int)
     with torch.no_grad():
         for data_batch in data_loader:
-            dialogue_adjs, dialogue_tokens, dialogue_sen, dialogue_emo, dialogue_imgs, dialogue_sp_idx = data_batch
-            sen, emo = model.measure(dialogue_adjs, dialogue_tokens, dialogue_sen, dialogue_emo, dialogue_imgs, dialogue_sp_idx, job_embedding, sex_embedding, personality_embedding, sp_jsp_list, img_adj, predic=True)
+            if args.dataset == 'MELD':
+                dialogue_adjs, dialogue_tokens, dialogue_sen, dialogue_emo, dialogue_imgs, dialogue_sp_idx = data_batch
+                sen, emo = model.measure(dialogue_adjs, dialogue_tokens, dialogue_sen, dialogue_emo, dialogue_imgs, dialogue_sp_idx, job_embedding, sex_embedding, personality_embedding, sp_jsp_list, img_adj, predic=True)
+            else:
+                dialogue_adjs, dialogue_tokens, dialogue_sen, dialogue_emo, dialogue_imgs = data_batch
+                sen, emo = model.measure(dialogue_adjs, dialogue_tokens, dialogue_sen, dialogue_emo, dialogue_imgs, None, job_embedding, sex_embedding, personality_embedding, sp_jsp_list, img_adj, predic=True)
             dialogue_sen = torch.LongTensor(expand_list(dialogue_sen))
             dialogue_emo = torch.LongTensor(expand_list(dialogue_emo))
             if torch.cuda.is_available():
@@ -131,11 +135,12 @@ def evaluate(model, data_loader, job_embedding, sex_embedding, personality_embed
         emo_f1 = metrics.f1_score(emo_labels_all, emo_predict_all, average="macro")
 
     if test:
+        sentiment_list = ['positive', 'neutral', 'negative']
         if args.dataset == 'MELD':
-            sentiment_list = ['positive', 'neutral', 'negative']
             emotion_list = ['anger', 'disgust', 'fear', 'joy', 'neutral', 'sadness', 'surprise']
-        elif args.dataset == 'MSED':
-            sentiment_list = ['positive', 'neutral', 'negative']
+        elif args.dataset == 'MEISD':
+            emotion_list = ['anger', 'disgust', 'joy', 'surprise', 'acceptance', 'sadness', 'fear', 'neutral', 'like']
+        else: # 'MSED'
             emotion_list = ['happiness', 'neutral', 'anger', 'disgust', 'fear', 'sad']
         if args.task == 's':
             sen_report = metrics.classification_report(sen_labels_all, sen_predict_all, labels=list(range(len(sentiment_list))), target_names=sentiment_list, digits=4)
@@ -149,9 +154,8 @@ def evaluate(model, data_loader, job_embedding, sex_embedding, personality_embed
             emo_confusion = metrics.confusion_matrix(emo_labels_all, emo_predict_all)
         else:
             sen_report = metrics.classification_report(sen_labels_all, sen_predict_all, labels=list(range(len(sentiment_list))), target_names=sentiment_list, digits=4)
-            emo_report = metrics.classification_report(emo_labels_all, emo_predict_all, labels=list(range(len(emotion_list))), target_names=emotion_list, digits=4)
-            
             sen_confusion = metrics.confusion_matrix(sen_labels_all, sen_predict_all)
+            emo_report = metrics.classification_report(emo_labels_all, emo_predict_all, labels=list(range(len(emotion_list))), target_names=emotion_list, digits=4)
             emo_confusion = metrics.confusion_matrix(emo_labels_all, emo_predict_all)
         return sen_acc, sen_f1, sen_loss_total / len(data_loader), sen_report, sen_confusion, emo_acc, emo_f1, emo_loss_total / len(data_loader), emo_report, emo_confusion
     return sen_acc, sen_f1, sen_loss_total / len(data_loader), emo_acc, emo_f1, emo_loss_total / len(data_loader)
@@ -167,13 +171,9 @@ def training(model, train_loader, dev_loader, max_grad, job_embedding, sex_embed
     sen_best_epoch = -1
     emo_best_epoch = -1
 
-    if args.dataset != 'MSED':
-        bert_params_id = list(map(id, model.bert.parameters()))
-        base_params = filter(lambda p: id(p) not in bert_params_id, model.parameters())
-        optimizer = torch.optim.Adam([{'params': base_params, 'lr': args.lr}, {'params': model.bert.parameters(), 'lr': args.bert_lr}])
-    else:
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-
+    bert_params_id = list(map(id, model.bert.parameters()))
+    base_params = filter(lambda p: id(p) not in bert_params_id, model.parameters())
+    optimizer = torch.optim.Adam([{'params': base_params, 'lr': args.lr}, {'params': model.bert.parameters(), 'lr': args.bert_lr}])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=args.scheduler_factor, patience=args.scheduler_patience, verbose=True, threshold=0.0001, threshold_mode='rel', cooldown=0, min_lr=0, eps=1e-08)
 
     for epoch in range(args.epoch):
@@ -184,7 +184,10 @@ def training(model, train_loader, dev_loader, max_grad, job_embedding, sex_embed
         for i, data_batch in enumerate(train_loader):
             optimizer.zero_grad()
 
-            batch_loss = model.measure(*data_batch, job_embedding, sex_embedding, personality_embedding, sp_jsp_list, img_adj)
+            if args.dataset == 'MELD':
+                batch_loss = model.measure(*data_batch, job_embedding, sex_embedding, personality_embedding, sp_jsp_list, img_adj)
+            else:
+                batch_loss = model.measure(*data_batch, None, job_embedding, sex_embedding, personality_embedding, sp_jsp_list, img_adj)
             total_loss += batch_loss.cpu().item()
 
             batch_loss.backward()
@@ -233,6 +236,7 @@ def training(model, train_loader, dev_loader, max_grad, job_embedding, sex_embed
 
     return sen_ckpt, emo_ckpt, model
 
+
 def gen_img_adj(h, w):
     adj = []
     for i in range(h*w):
@@ -266,8 +270,6 @@ def gen_img_adj(h, w):
 if __name__ == '__main__':
     print(args)
 
-    set_seed(args.seed)
-
     train_set = dataset(args.dataset, 'train')
     train_loader = DataLoader(train_set, args.batch_size, shuffle=False, collate_fn=_collate_func, num_workers=args.num_workers, pin_memory=True)
     dev_set = dataset(args.dataset, 'dev')
@@ -293,13 +295,17 @@ if __name__ == '__main__':
                   dataset=args.dataset,
                   mode=args.mode,
                   task=args.task)
+
     if torch.cuda.is_available():
         model = model.cuda()
 
     if args.dataset == 'MELD':
         sen_best_model_file = './save/sen_best.pt'
         emo_best_model_file = './save/emo_best.pt'
-    elif args.dataset == 'MSED':
+    elif args.dataset == 'MEISD':
+        sen_best_model_file = './save/sen_best_MEISD.pt'
+        emo_best_model_file = './save/emo_best_MEISD.pt'
+    else: # args.dataset == 'MSED'
         sen_best_model_file = './save/sen_best_MSED.pt'
         emo_best_model_file = './save/emo_best_MSED.pt'
 
@@ -307,26 +313,7 @@ if __name__ == '__main__':
     sen_ckpt, emo_ckpt, model = training(model, train_loader, dev_loader, args.max_grad, job_embedding, sex_embedding, personality_embedding, sp_jsp_list, img_adj)
     print('train time is {}'.format(time.time() - time_start))
 
-    # last model testing
-    sen_acc, sen_f1, sen_loss, sen_report, sen_confusion, emo_acc, emo_f1, emo_loss, emo_report, emo_confusion = evaluate(model, test_loader, job_embedding, sex_embedding, personality_embedding, sp_jsp_list, img_adj, test=True)
-    
-    if args.task != 'e':
-        sen_msg = 'Sentiment Test Loss: {0:>5.2},  Sentiment Test Acc: {1:>6.2%}'
-        print(sen_msg.format(sen_loss, sen_acc))
-        print("Precision, Recall and F1-Score...")
-        print(sen_report)
-        print("Confusion Matrix...")
-        print(sen_confusion)
-
-    if args.task != 's':
-        emo_msg = 'Emotion Test Loss: {0:>5.2},  Emotion Test Acc: {1:>6.2%}'
-        print(emo_msg.format(emo_loss, emo_acc))
-        print("Precision, Recall and F1-Score...")
-        print(emo_report)
-        print("Confusion Matrix...")
-        print(emo_confusion)
-
-    # best sen model testing
+    # best model testing
     if args.task != 'e':
         model.load_state_dict(sen_ckpt['best_state'])
         sen_acc, sen_f1, sen_loss, sen_report, sen_confusion, emo_acc, emo_f1, emo_loss, emo_report, emo_confusion = evaluate(model, test_loader, job_embedding, sex_embedding, personality_embedding, sp_jsp_list, img_adj, test=True)
@@ -347,7 +334,6 @@ if __name__ == '__main__':
             sen_ckpt['best_dev_f1'] = sen_f1
             torch.save(sen_ckpt, sen_best_model_file)
 
-    # best emo model testing
     if args.task != 's':
         model.load_state_dict(emo_ckpt['best_state'])
         sen_acc, sen_f1, sen_loss, sen_report, sen_confusion, emo_acc, emo_f1, emo_loss, emo_report, emo_confusion = evaluate(model, test_loader, job_embedding, sex_embedding, personality_embedding, sp_jsp_list, img_adj, test=True)

@@ -5,7 +5,6 @@ from .layers import GraphAttentionLayer, SpGraphAttentionLayer
 from utils.load import expand_list
 from transformers import BertModel
 from torch.autograd import Variable
-import time
 import numpy as np
 import torchvision.models as models
 
@@ -19,31 +18,21 @@ class M3GAT(nn.Module):
         self.sen_class = sen_class
         self.emo_class = emo_class
         self.hidden_dim = hidden_dim
-        if dataset != 'MSED':
-            self.bert = BertModel.from_pretrained('bert-base-uncased')
-        self.text_encoder = TextEncoder(nfeat=768, nhid=768, nclass=hidden_dim, dropout=dropout, alpha=alpha, nheads=nheads, nlayers=nlayers_TE, dataset=dataset)
+        self.bert = BertModel.from_pretrained('bert-base-uncased')
+        self.text_encoder = TextEncoder(nfeat=768, nhid=768, nclass=hidden_dim, dropout=dropout, alpha=alpha, nheads=nheads, nlayers=nlayers_TE)
         self.img_encoder = ImageEncoder(nfeat=3, nhid=3, nclass=hidden_dim, dropout=dropout, alpha=alpha, nheads=nheads, nlayers=nlayers_IE, dataset=dataset)
         self.mti_graph = MultiTaskInteractiveGraph(nfeat=hidden_dim, nhid=hidden_dim, nclass=hidden_dim, dropout=dropout, alpha=alpha, nheads=nheads, nlayers=nlayers_MTI, z=z, dataset=dataset, mode=mode, task=task)
         self.linear0 = nn.Linear(hidden_dim, hidden_dim)
-        self.linear1 = nn.Linear(hidden_dim, sen_class)
-        self.linear2 = nn.Linear(hidden_dim, emo_class)
+        if dataset != 'MSED':
+            self.linear1 = nn.Linear(hidden_dim, sen_class)
+            self.linear2 = nn.Linear(hidden_dim, emo_class)
+        else:
+            self.linear1 = nn.Linear(2*hidden_dim, sen_class)
+            self.linear2 = nn.Linear(2*hidden_dim, emo_class)
         self.linear3 = nn.Linear(768, hidden_dim)
         self.lstm = nn.LSTM(input_size=hidden_dim, hidden_size=hidden_dim//2, batch_first=True, bidirectional=True)
-
         self.criterion = torch.nn.CrossEntropyLoss()
         self.dropout = nn.Dropout(dropout)
-
-        if dataset == 'MSED':
-            if task != 'e':
-                if mode == 't+v':
-                    self.linear_sen = nn.Linear(768*2, sen_class)
-                else:
-                    self.linear_sen = nn.Linear(768, sen_class)
-            if task != 's':
-                if mode == 't+v':
-                    self.linear_emo = nn.Linear(768*2, emo_class)
-                else:
-                    self.linear_emo = nn.Linear(768, emo_class)
 
     def padding(self, dialogue_adjs, dialogue_tokens):
         dialogue_tokens_len = len(dialogue_tokens)
@@ -107,71 +96,111 @@ class M3GAT(nn.Module):
                 for dia in dialogue_imgs:
                     for utt in dia[i]:
                         new_dialogue_imgs.append(utt.unsqueeze(0))
+
             return torch.cat(new_dialogue_imgs, dim=0)
-        elif self.dataset == 'MSED':
+        elif self.dataset == 'MEISD':
             new_dialogue_imgs = []
             for dia in dialogue_imgs:
-                new_dialogue_imgs.append(dia[0].unsqueeze(0))
+                for utt in dia:
+                    new_dialogue_imgs.append(utt.reshape(1, -1))
+            return torch.from_numpy(np.concatenate(new_dialogue_imgs, axis=0))
+        else: # self.dataset == 'MSED'
+            new_dialogue_imgs = []
+            for dia in dialogue_imgs:
+                for utt in dia:
+                    new_dialogue_imgs.append(utt.unsqueeze(0))
             return torch.cat(new_dialogue_imgs, dim=0)
 
     def forward(self, dialogue_adjs, dialogue_emb, dialogue_imgs, img_adj, utt_num_list, seq_lengths, dialogue_sp_idx, job_embedding, sex_embedding, personality_embedding, sp_jsp_list):
         # dialogue_adjs.shape = d x u x t x t
         # dialogue_emb.shape = d x u x t x 768
+        t_sen_features, t_emo_features = self.text_encoder(dialogue_emb, dialogue_adjs, seq_lengths) # t_sen_features.shape = d x u x hidden_dim, t_emo_features.shape = d x u x hidden_dim
 
-        t_sen_features, t_emo_features = self.text_encoder(dialogue_emb, dialogue_adjs, utt_num_list) # t_sen_features.shape = total_utt_num x hidden_dim, t_emo_features.shape = total_utt_num x hidden_dim
+        input_sen = []
+        for i, utt_num in enumerate(utt_num_list):
+            input_sen.append(t_sen_features[i, 0:utt_num, :])
+        input_sen = torch.cat(input_sen, dim=0)
 
-        if self.dataset != 'MSED':
-            input_sen = []
-            for i, utt_num in enumerate(utt_num_list):
-                input_sen.append(t_sen_features[i, 0:utt_num, :])
-            input_sen = torch.cat(input_sen, dim=0)
-
-            input_emo = []
-            for i, utt_num in enumerate(utt_num_list):
-                input_emo.append(t_emo_features[i, 0:utt_num, :])
-            input_emo = torch.cat(input_emo, dim=0)
+        input_emo = []
+        for i, utt_num in enumerate(utt_num_list):
+            input_emo.append(t_emo_features[i, 0:utt_num, :])
+        input_emo = torch.cat(input_emo, dim=0)
 
         v_sen_features, v_emo_features = self.img_encoder(dialogue_imgs, img_adj) # v_sen_features.shape = total_utt_num x hidden_dim, v_emo_features.shape = total_utt_num x hidden_dim
 
         if self.dataset == 'MSED':
-            if self.mode == 't':
-                input_sen = t_sen_features
-                input_emo = t_emo_features
-            elif self.mode == 'v':
-                input_sen = v_sen_features
-                input_emo = v_emo_features
-            else:
-                input_sen = torch.cat([t_sen_features, v_sen_features], dim=-1)
-                input_emo = torch.cat([t_emo_features, v_emo_features], dim=-1)
+            d = t_sen_features.shape[0]
+            v_start = 0
+            v_end = 0
+
+            sen = []
+            emo = []
+            for dialogue_idx in range(d):
+
+                utt_num = utt_num_list[dialogue_idx]
+                v_end += utt_num
+
+                t_sen = t_sen_features[dialogue_idx][0:utt_num] # utt_num x hidden_dim
+                t_emo = t_emo_features[dialogue_idx][0:utt_num] # utt_num x hidden_dim
+                v_sen = v_sen_features[v_start:v_end] # utt_num x hidden_dim
+                v_emo = v_emo_features[v_start:v_end] # utt_num x hidden_dim
+
+                v_start = v_end
+
+                sen.append(torch.cat([t_sen, v_sen], dim=-1))
+                emo.append(torch.cat([t_emo, v_emo], dim=-1))
+            
+            sen = torch.cat(sen, dim=0)
+            emo = torch.cat(emo, dim=0)
+
+            return self.dropout(self.linear1(sen)), self.dropout(self.linear2(emo))
+
 
         if self.hidden_dim != 768:
             sen, emo = self.mti_graph(t_sen_features, t_emo_features, v_sen_features, v_emo_features, utt_num_list, dialogue_sp_idx, self.linear3(job_embedding), self.linear3(sex_embedding), self.linear3(personality_embedding), sp_jsp_list) # sen.shape = total_utt_num x hidden_dim, emo.shape = total_utt_num x hidden_dim
         else:
             sen, emo = self.mti_graph(t_sen_features, t_emo_features, v_sen_features, v_emo_features, utt_num_list, dialogue_sp_idx, job_embedding, sex_embedding, personality_embedding, sp_jsp_list) # sen.shape = total_utt_num x hidden_dim, emo.shape = total_utt_num x hidden_dim
 
-        if self.dataset == 'MSED':
+        if self.dataset == 'MEISD':
             if self.task == 's':
-                return self.dropout(self.linear_sen(sen + input_sen)), None
+                return self.dropout(self.linear1(sen+input_sen)), None
             elif self.task == 'e':
-                return None, self.dropout(self.linear_emo(emo + input_emo))
+                return None, self.dropout(self.linear2(emo+input_emo))
             else:
-                return self.dropout(self.linear_sen(sen + input_sen)), self.dropout(self.linear_emo(emo + input_emo))
+                return self.dropout(self.linear1(sen+input_sen)), self.dropout(self.linear2(emo+input_emo))
 
-        sen_prime = self.dropout((self.linear0(sen)))
+        if self.task == 's':
+            sen_prime = self.dropout((self.linear0(sen)))
+            # residual
+            sen_res = sen_prime + input_sen
+            return self.dropout(self.linear1(sen_res)), None
+        elif self.task == 'e':
+            start = 0
+            emo_prime = []
+            for utt_num in utt_num_list:
+                h = emo[start:start+utt_num].unsqueeze(0)
+                start += utt_num
+                h, _ = self.lstm(h)
+                emo_prime.append(h.squeeze(0))
+            # residual
+            emo_res = torch.cat(emo_prime, dim=0) + input_emo
+            return None, self.dropout(self.linear2(emo_res))
+        else:
+            sen_prime = self.dropout((self.linear0(sen)))
 
-        start = 0
-        emo_prime = []
-        for utt_num in utt_num_list:
-            h = emo[start:start+utt_num].unsqueeze(0)
-            start += utt_num
-            h, _ = self.lstm(h)
-            emo_prime.append(h.squeeze(0))
+            start = 0
+            emo_prime = []
+            for utt_num in utt_num_list:
+                h = emo[start:start+utt_num].unsqueeze(0)
+                start += utt_num
+                h, _ = self.lstm(h)
+                emo_prime.append(h.squeeze(0))
 
-        # residual
-        sen_res = sen_prime + input_sen
-        emo_res = torch.cat(emo_prime, dim=0) + input_emo
+            # residual
+            sen_res = sen_prime + input_sen
+            emo_res = torch.cat(emo_prime, dim=0) + input_emo
 
-        return self.dropout(self.linear1(sen_res)), self.dropout(self.linear2(emo_res))
+            return self.dropout(self.linear1(sen_res)), self.dropout(self.linear2(emo_res))
 
     def measure(self, dialogue_adjs, dialogue_tokens, dialogue_sen, dialogue_emo, dialogue_imgs, dialogue_sp_idx, job_embedding, sex_embedding, personality_embedding, sp_jsp_list, img_adj, predic=False):
         dialogue_adjs, dialogue_tokens, masks, utt_num_list, seq_lengths = self.padding(dialogue_adjs, dialogue_tokens)
@@ -199,11 +228,8 @@ class M3GAT(nn.Module):
         tokens_num = len(dialogue_tokens[0][0])
         dialogue_tokens = dialogue_tokens.view(-1, tokens_num)
 
-        if self.dataset != 'MSED':
-            dialogue_features = self.bert(input_ids=dialogue_tokens, attention_mask=masks).last_hidden_state
-            dialogue_features = dialogue_features.view(dialog_num, -1, tokens_num, 768)[:, :, 1:-1, :] # delete [CLS] & [SEP]
-        else:
-            dialogue_features = [dialogue_tokens, masks]
+        dialogue_features = self.bert(input_ids=dialogue_tokens, attention_mask=masks).last_hidden_state
+        dialogue_features = dialogue_features.view(dialog_num, -1, tokens_num, 768)[:, :, 1:-1, :] # delete [CLS] & [SEP]
 
         sen, emo = self.forward(dialogue_adjs, dialogue_features, dialogue_imgs, img_adj, utt_num_list, seq_lengths, dialogue_sp_idx, job_embedding, sex_embedding, personality_embedding, sp_jsp_list)
 
@@ -223,62 +249,41 @@ class M3GAT(nn.Module):
 
 
 class TextEncoder(nn.Module):
-    def __init__(self, nfeat, nhid, nclass, dropout, alpha, nheads, nlayers, dataset):
+    def __init__(self, nfeat, nhid, nclass, dropout, alpha, nheads, nlayers):
         super(TextEncoder, self).__init__()
 
-        self.dataset = dataset
         self.nclass = nclass
         self.dropout = nn.Dropout(dropout)
 
-        if dataset != 'MSED':
-            self.GATs = [GAT(nfeat, nhid, nhid, dropout, alpha, nheads) for _ in range(nlayers)]
-            for i, _GAT in enumerate(self.GATs):
-                self.add_module('GAT_{}'.format(i), _GAT)
-            self.BiLSTM = nn.LSTM(input_size=nhid, hidden_size=nhid, batch_first=True, dropout=dropout, bidirectional=True)
-            self.sen = nn.Linear(nhid*2, nclass)
-            self.emo = nn.Linear(nhid*2, nclass)
+        self.GATs = [GAT(nfeat, nhid, nhid, dropout, alpha, nheads) for _ in range(nlayers)]
+        for i, _GAT in enumerate(self.GATs):
+            self.add_module('GAT_{}'.format(i), _GAT)
 
-        else:
-            self.bert_sen = BertModel.from_pretrained('bert-base-uncased')
-            self.bert_emo = BertModel.from_pretrained('bert-base-uncased')
-            if nclass != 768:
-                self.sen = nn.Linear(768, nclass)
-                self.emo = nn.Linear(768, nclass)
+        self.BiLSTM = nn.LSTM(input_size=nhid, hidden_size=nhid, batch_first=True, dropout=dropout, bidirectional=True)
+        self.sen = nn.Linear(nhid*2, nclass)
+        self.emo = nn.Linear(nhid*2, nclass)
 
     def forward(self, x, adj, seq_lengths):
-        if self.dataset != 'MSED':
-            # x.shape = d x u x t x 768
-            input_x = x
-            x = self.dropout(x)
+        # x.shape = d x u x t x 768
+        input_x = x
+        x = self.dropout(x)
 
-            for  _GAT in self.GATs:
-                x = _GAT(x, adj) # x.shape = d x u x t x 768
+        for  _GAT in self.GATs:
+            x = _GAT(x, adj) # x.shape = d x u x t x 768
 
-            x = input_x + x
+        x = input_x + x
 
-            d_num = x.shape[0]
-            u_num = x.shape[1]
-            t_num = x.shape[-2]
-            x = x.view(-1, t_num, 768)
-            batch_size = x.shape[0]
+        d_num = x.shape[0]
+        u_num = x.shape[1]
+        t_num = x.shape[-2]
+        x = x.view(-1, t_num, 768)
+        batch_size = x.shape[0]
 
-            h, _ = self.BiLSTM(x) # h.shape = batch_size x t_num x nhid*2
-            h = self.bi_fetch(h, seq_lengths, batch_size, t_num) # h.shape = batch_size x nhid*2
-            h = h.view(d_num, u_num, -1) # h_sen.shape = d x u x nhid*2
+        h, _ = self.BiLSTM(x) # h.shape = batch_size x t_num x nhid*2
+        h = self.bi_fetch(h, seq_lengths, batch_size, t_num) # h.shape = batch_size x nhid*2
+        h = h.view(d_num, u_num, -1) # h_sen.shape = d x u x nhid*2
 
-            return self.dropout(self.sen(h)), self.dropout(self.emo(h))
-        
-        else:
-            # x.shape = d x 768
-            x_sen = self.bert_sen(input_ids=x[0], attention_mask=x[1]).pooler_output
-            x_emo = self.bert_emo(input_ids=x[0], attention_mask=x[1]).pooler_output
-
-            if self.nclass == 768:
-                return x_sen, x_emo
-            else:
-                return self.dropout(self.sen(x_sen)), self.dropout(self.emo(x_emo))
-
-
+        return self.dropout(self.sen(h)), self.dropout(self.emo(h))
     
     def bi_fetch(self, rnn_outs, seq_lengths, batch_size, max_len):
         rnn_outs = rnn_outs.view(batch_size, max_len, 2, -1)
@@ -333,41 +338,37 @@ class GAT(nn.Module):
 class ImageEncoder(nn.Module):
     def __init__(self, nfeat, nhid, nclass, dropout, alpha, nheads, nlayers, dataset):
         super(ImageEncoder, self).__init__()
-
         self.dataset = dataset
         self.nclass = nclass
 
-        if dataset != 'MSED':
-            self.resnet18 = models.resnet18(pretrained=True)
-        else:
-            self.resnet_sen = models.resnet18(pretrained=True)
-            self.resnet_emo = models.resnet18(pretrained=True)
         if dataset == 'MELD':
+            self.resnet18 = models.resnet18(pretrained=True)
             self.sen = nn.Linear(3000, nclass)
             self.emo = nn.Linear(3000, nclass)
-        else:
+        elif dataset == 'MEISD':
+            self.sen = nn.Linear(2048, nclass)
+            self.emo = nn.Linear(2048, nclass)
+        else: # dataset == 'MSED'
+            self.resnet18 = models.resnet18(pretrained=True)
             self.sen = nn.Linear(1000, nclass)
             self.emo = nn.Linear(1000, nclass)
 
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, adj):
-        if self.dataset != 'MSED':
+        if self.dataset != 'MEISD':
             x = x.permute(0, 3, 1, 2)
             out = self.resnet18(x) # out.shape = 3*total_utt_num x 1000
-            del x
-
-            total_utt_num = out.shape[0] // 3
-            out1 = torch.cat([out[0:total_utt_num, :], out[total_utt_num:2*total_utt_num, :], out[2*total_utt_num:3*total_utt_num, :]], dim=-1) # total_utt_num x 3000
-            return self.dropout(self.sen(out1)), self.dropout(self.emo(out1)) # total_utt_num x nclass
-        
         else:
-            x = x.permute(0, 3, 1, 2)
-            sen = self.resnet_sen(x) # out.shape = total_utt_num x 1000
-            emo = self.resnet_emo(x)
-            del x
+            return self.dropout(self.sen(x)), self.dropout(self.emo(x))
 
-            return self.dropout(self.sen(sen)), self.dropout(self.emo(emo)) # total_utt_num x nclass
+        if self.dataset == 'MSED':
+            return self.dropout(self.sen(out)), self.dropout(self.emo(out))
+
+        total_utt_num = out.shape[0] // 3
+        out1 = torch.cat([out[0:total_utt_num, :], out[total_utt_num:2*total_utt_num, :], out[2*total_utt_num:3*total_utt_num, :]], dim=-1) # total_utt_num x 3000
+        return self.dropout(self.sen(out1)), self.dropout(self.emo(out1)) # total_utt_num x nclass
+
 
 class SpGAT(nn.Module):
     def __init__(self, nfeat, nhid, nclass, dropout, alpha, nheads):
@@ -392,18 +393,15 @@ class SpGAT(nn.Module):
     def forward(self, x, adj):
         x = self.dropout(x)
         x = torch.cat([torch.cat([att(row, adj).unsqueeze(0) for row in x], dim=0) for att in self.attentions], dim=-1)
-
         x = self.dropout(x)
-        x = F.elu(torch.cat([self.out_att(row, adj).unsqueeze(0) for row in x], dim=0), inplace=True) # x.shape = 3*total_utt_num x (720*1280) x 3
+        x = F.elu(torch.cat([self.out_att(row, adj).unsqueeze(0) for row in x], dim=0), inplace=True)
         x = self.dropout(x)
-
         return x
 
 
 class MultiTaskInteractiveGraph(nn.Module):
     def __init__(self, nfeat, nhid, nclass, dropout, alpha, nheads, nlayers, z, dataset, mode, task):
         super(MultiTaskInteractiveGraph, self).__init__()
-
         self.dataset = dataset
         self.mode = mode
         self.task = task
@@ -416,17 +414,28 @@ class MultiTaskInteractiveGraph(nn.Module):
             self.add_module('ConGAT_{}'.format(i), _ConGAT)
 
     def forward(self, t_sen_features, t_emo_features, v_sen_features, v_emo_features, utt_num_list, dialogue_sp_idx, job_embedding, sex_embedding, personality_embedding, sp_jsp_list):
-        if self.dataset != 'MSED':
-            # t_sen_features.shape = d x u x hidden_dim, t_emo_features.shape = d x u x hidden_dim
-            # v_sen_features.shape = total_utt_num x hidden_dim, v_emo_features.shape = total_utt_num x hidden_dim
+        # t_sen_features.shape = d x u x hidden_dim, t_emo_features.shape = d x u x hidden_dim
+        # v_sen_features.shape = total_utt_num x hidden_dim, v_emo_features.shape = total_utt_num x hidden_dim
 
-            d = t_sen_features.shape[0]
-            v_start = 0
-            v_end = 0
+        d = t_sen_features.shape[0]
+        v_start = 0
+        v_end = 0
 
-            sen = []
-            emo = []
-            for dialogue_idx in range(d):
+        sen = []
+        emo = []
+        for dialogue_idx in range(d):
+
+            utt_num = utt_num_list[dialogue_idx]
+            v_end += utt_num
+
+            t_sen = t_sen_features[dialogue_idx][0:utt_num] # utt_num x hidden_dim
+            t_emo = t_emo_features[dialogue_idx][0:utt_num] # utt_num x hidden_dim
+            v_sen = v_sen_features[v_start:v_end] # utt_num x hidden_dim
+            v_emo = v_emo_features[v_start:v_end] # utt_num x hidden_dim
+
+            v_start = v_end
+
+            if self.dataset == 'MELD':
                 sp_idx = dialogue_sp_idx[dialogue_idx]
                 sp_num = len(set(sp_idx))
                 utt_sp_idx = [list(set(sp_idx)).index(idx) for idx in sp_idx]
@@ -441,68 +450,51 @@ class MultiTaskInteractiveGraph(nn.Module):
                     sp_info.append(torch.cat([speaker.unsqueeze(0), job.unsqueeze(0), sex.unsqueeze(0), personality.unsqueeze(0)], dim=0)) # 4 x hidden_dim
                 sp_info = torch.cat(sp_info, dim=0) # (4*sp_num) x hidden_dim
 
-                utt_num = utt_num_list[dialogue_idx]
-                v_end += utt_num
-
-                t_sen = t_sen_features[dialogue_idx][0:utt_num] # utt_num x hidden_dim
-                t_emo = t_emo_features[dialogue_idx][0:utt_num] # utt_num x hidden_dim
-                v_sen = v_sen_features[v_start:v_end] # utt_num x hidden_dim
-                v_emo = v_emo_features[v_start:v_end] # utt_num x hidden_dim
-
-                v_start = v_end
-
-                adj = self.gen_adj(utt_num, sp_num, utt_sp_idx, self.z)
-                if torch.cuda.is_available():
-                    adj = adj.cuda()
-
-                x = torch.cat([t_sen, t_emo, v_sen, v_emo, sp_info, sp_info, sp_info, sp_info], dim=0) # (4*utt_num + 16*sp_num) x hidden_dim
-                for  _ConGAT in self.ConGATs:
-                    x = _ConGAT(x, adj)
-
-                t_sen = x[0:utt_num]
-                t_emo = x[utt_num:2*utt_num]
-                v_sen = x[2*utt_num:3*utt_num]
-                v_emo = x[3*utt_num:4*utt_num]
-                del x
-                del adj
-
-                sen.append(t_sen)
-                emo.append(t_emo)
-                del t_sen
-                del v_sen
-                del t_emo
-                del v_emo
-            
-            return torch.cat(sen, dim=0), torch.cat(emo, dim=0)
-        
-        else:
-            # t_sen_features.shape = d x hidden_dim, t_emo_features.shape = d x hidden_dim
-            # v_sen_features.shape = d x hidden_dim, v_emo_features.shape = d x hidden_dim
-
-            d = t_sen_features.shape[0]
-            
-            if self.mode == 't':
-                if self.task == 's':
-                    x = t_sen_features
-                elif self.task == 'e':
-                    x = t_emo_features
+                adj = self.gen_adj(utt_num, sp_num, utt_sp_idx)
+                if self.mode == 't':
+                    if self.task == 's':
+                        x = torch.cat([t_sen, sp_info], dim=0)
+                    elif self.task == 'e':
+                        x = torch.cat([t_emo, sp_info], dim=0)
+                    else:
+                        x = torch.cat([t_sen, t_emo, sp_info, sp_info], dim=0)
+                elif self.mode == 'v':
+                    if self.task == 's':
+                        x = torch.cat([v_sen, sp_info], dim=0)
+                    elif self.task == 'e':
+                        x = torch.cat([v_emo, sp_info], dim=0)
+                    else:
+                        x = torch.cat([v_sen, v_emo, sp_info, sp_info], dim=0)
                 else:
-                    x = torch.cat([t_sen_features, t_emo_features], dim=0)
-            elif self.mode == 'v':
-                if self.task == 's':
-                    x = v_sen_features
-                elif self.task == 'e':
-                    x = v_emo_features
-                else:
-                    x = torch.cat([v_sen_features, v_emo_features], dim=0)
+                    if self.task == 's':
+                        x = torch.cat([t_sen, v_sen, sp_info, sp_info], dim=0)
+                    elif self.task == 'e':
+                        x = torch.cat([t_emo, v_emo, sp_info, sp_info], dim=0)
+                    else:
+                        x = torch.cat([t_sen, t_emo, v_sen, v_emo, sp_info, sp_info, sp_info, sp_info], dim=0) # (4*utt_num + 16*sp_num) x hidden_dim
             else:
-                if self.task == 's':
-                    x = torch.cat([t_sen_features, v_sen_features], dim=0)
-                elif self.task == 'e':
-                    x = torch.cat([t_emo_features, v_emo_features], dim=0)
+                adj = self.gen_adj(utt_num, None, None)
+                if self.mode == 't':
+                    if self.task == 's':
+                        x = t_sen
+                    elif self.task == 'e':
+                        x = t_emo
+                    else:
+                        x = torch.cat([t_sen, t_emo], dim=0)
+                elif self.mode == 'v':
+                    if self.task == 's':
+                        x = v_sen
+                    elif self.task == 'e':
+                        x = v_emo
+                    else:
+                        x = torch.cat([v_sen, v_emo], dim=0)
                 else:
-                    x = torch.cat([t_sen_features, t_emo_features, v_sen_features, v_emo_features], dim=0)
-            adj = self.gen_adj(d, None, None)
+                    if self.task == 's':
+                        x = torch.cat([t_sen, v_sen], dim=0)
+                    elif self.task == 'e':
+                        x = torch.cat([t_emo, v_emo], dim=0)
+                    else:
+                        x = torch.cat([t_sen, t_emo, v_sen, v_emo], dim=0) # 4*utt_num x hidden_dim
 
             if torch.cuda.is_available():
                 adj = adj.cuda()
@@ -510,115 +502,205 @@ class MultiTaskInteractiveGraph(nn.Module):
             for  _ConGAT in self.ConGATs:
                 x = _ConGAT(x, adj)
 
-            if self.mode == 't':
-                if self.task == 's':
-                    return x, None
-                elif self.task == 'e':
-                    return None, x
-                else:
-                    t_sen, t_emo = torch.chunk(x, 2, dim=0)
-                    return t_sen, t_emo
-            elif self.mode == 'v':
-                if self.task == 's':
-                    return x, None
-                elif self.task == 'e':
-                    return None, x
-                else:
-                    v_sen, v_emo = torch.chunk(x, 2, dim=0)
-                    return v_sen, v_emo
+            if self.task == 's':
+                sen.append(x[0:utt_num])
+            elif self.task == 'e':
+                emo.append(x[0:utt_num])
             else:
-                if self.task == 's':
-                    t_sen, v_sen = torch.chunk(x, 2, dim=0)
-                    return torch.cat([t_sen, v_sen], dim=-1), None
-                elif self.task == 'e':
-                    t_emo, v_emo = torch.chunk(x, 2, dim=0)
-                    return None, torch.cat([t_emo, v_emo], dim=-1)
-                else:
-                    t_sen, t_emo, v_sen, v_emo = torch.chunk(x, 4, dim=0)
-                    
-                    return torch.cat([t_sen, v_sen], dim=1), torch.cat([t_emo, v_emo], dim=1)
+                sen.append(x[0:utt_num])
+                emo.append(x[utt_num:2*utt_num])
+        
+        if self.task == 's':
+            return torch.cat(sen, dim=0), None
+        elif self.task == 'e':
+            return None, torch.cat(emo, dim=0)
+        else:
+            return torch.cat(sen, dim=0), torch.cat(emo, dim=0)
             
     def gen_adj(self, utt_num, sp_num, utt_sp_idx):
-        if self.dataset != 'MSED':
-            adj = torch.zeros((utt_num, utt_num), dtype=int)
-            for i, row in enumerate(adj):
-                for j, col in enumerate(row):
-                    if abs(i-j) <= self.z:
-                        adj[i][j] = 1
-            adj1 = torch.cat([adj, adj, adj, torch.zeros_like(adj)], dim=0)
-            adj2 = torch.cat([adj, adj, torch.zeros_like(adj), adj], dim=0)
-            adj3 = torch.cat([adj, torch.zeros_like(adj), adj, adj], dim=0)
-            adj4 = torch.cat([torch.zeros_like(adj), adj, adj, adj], dim=0)
-            adj = torch.cat([adj1, adj2, adj3, adj4], dim=1)
-            cen = utt_num // 2
-            for i in range(4):
-                c = cen + i * utt_num
-                for j in range(utt_num):
-                    adj[c][i*utt_num+j] = 1
+        if self.dataset != 'MELD':
+            if self.mode == 't+v':
+                if self.task == 's+e':
+                    adj = torch.zeros((utt_num, utt_num), dtype=int)
+                    for i, row in enumerate(adj):
+                        for j, col in enumerate(row):
+                            if abs(i-j) <= self.z:
+                                adj[i][j] = 1
 
-            adj = torch.cat([torch.cat([adj, torch.zeros((4*utt_num, 16*sp_num), dtype=int)], dim=1), torch.zeros((16*sp_num, 4*utt_num+16*sp_num), dtype=int)], dim=0)
-            # connect to speaker node
-            for row in range(4*utt_num):
-                utt_idx = row % utt_num
-                sp_idx = utt_sp_idx[utt_idx]
-                adj[row][4*utt_num + 4*sp_num*(row // utt_num) + 4*sp_idx] = 1
-                adj[4*utt_num + 4*sp_num*(row // utt_num) + 4*sp_idx][row] = 1
-            # speaker, job, sex, personality node connect to each other
-            for idx in range(4*sp_num):
-                row = 4 * utt_num + 4 * idx
-                for i in range(4):
-                    for j in range(4):
-                        adj[row+i][row+j] = 1
-            
-            return adj
-        
-        else:
-            if self.mode == 't':
-                if self.task == 's':
-                    adj = torch.eye(utt_num, dtype=int)
-                elif self.task == 'e':
-                    adj = torch.eye(utt_num, dtype=int)
-                else:
-                    adj1 = torch.cat([torch.eye(utt_num, dtype=int), torch.eye(utt_num, dtype=int)], dim=0)
-                    adj = torch.cat([adj1, adj1], dim=1)
-            elif self.mode == 'v':
-                if self.task == 's':
-                    adj = torch.eye(utt_num, dtype=int)
-                elif self.task == 'e':
-                    adj = torch.eye(utt_num, dtype=int)
-                else:
-                    adj1 = torch.cat([torch.eye(utt_num, dtype=int), torch.eye(utt_num, dtype=int)], dim=0)
-                    adj = torch.cat([adj1, adj1], dim=1)
-            else:
-                if self.task == 's':
-                    adj1 = torch.cat([torch.eye(utt_num, dtype=int), torch.eye(utt_num, dtype=int)], dim=0)
-                    adj = torch.cat([adj1, adj1], dim=1)
-                elif self.task == 'e':
-                    adj1 = torch.cat([torch.eye(utt_num, dtype=int), torch.eye(utt_num, dtype=int)], dim=0)
-                    adj = torch.cat([adj1, adj1], dim=1)
-                else:
-                    adj = torch.eye(utt_num, dtype=int)
-                    
                     adj1 = torch.cat([adj, adj, adj, torch.zeros_like(adj)], dim=0)
                     adj2 = torch.cat([adj, adj, torch.zeros_like(adj), adj], dim=0)
                     adj3 = torch.cat([adj, torch.zeros_like(adj), adj, adj], dim=0)
                     adj4 = torch.cat([torch.zeros_like(adj), adj, adj, adj], dim=0)
-
-                    # # no cross-modal
-                    # adj1 = torch.cat([adj, adj, torch.zeros_like(adj), torch.zeros_like(adj)], dim=0)
-                    # adj2 = torch.cat([adj, adj, torch.zeros_like(adj), torch.zeros_like(adj)], dim=0)
-                    # adj3 = torch.cat([torch.zeros_like(adj), torch.zeros_like(adj), adj, adj], dim=0)
-                    # adj4 = torch.cat([torch.zeros_like(adj), torch.zeros_like(adj), adj, adj], dim=0)
-
-                    # # no cross task
-                    # adj1 = torch.cat([adj, torch.zeros_like(adj), adj, torch.zeros_like(adj)], dim=0)
-                    # adj2 = torch.cat([torch.zeros_like(adj), adj, torch.zeros_like(adj), adj], dim=0)
-                    # adj3 = torch.cat([adj, torch.zeros_like(adj), adj, torch.zeros_like(adj)], dim=0)
-                    # adj4 = torch.cat([torch.zeros_like(adj), adj, torch.zeros_like(adj), adj], dim=0)
-
                     adj = torch.cat([adj1, adj2, adj3, adj4], dim=1)
 
-            return adj
+                    cen = utt_num // 2
+                    for i in range(4):
+                        c = cen + i * utt_num
+                        for j in range(utt_num):
+                            adj[c][i*utt_num+j] = 1
+
+                else:
+                    adj = torch.zeros((utt_num, utt_num), dtype=int)
+                    for i, row in enumerate(adj):
+                        for j, col in enumerate(row):
+                            if abs(i-j) <= self.z:
+                                adj[i][j] = 1
+                    adj1 = torch.cat([adj, adj], dim=0)
+                    adj2 = torch.cat([adj, adj], dim=0)
+                    adj = torch.cat([adj1, adj2], dim=1)
+                    cen = utt_num // 2
+                    for i in range(2):
+                        c = cen + i * utt_num
+                        for j in range(utt_num):
+                            adj[c][i*utt_num+j] = 1
+
+            else:
+                if self.task == 's+e':
+                    adj = torch.zeros((utt_num, utt_num), dtype=int)
+                    for i, row in enumerate(adj):
+                        for j, col in enumerate(row):
+                            if abs(i-j) <= self.z:
+                                adj[i][j] = 1
+                    adj1 = torch.cat([adj, adj], dim=0)
+                    adj2 = torch.cat([adj, adj], dim=0)
+                    adj = torch.cat([adj1, adj2], dim=1)
+                    cen = utt_num // 2
+                    for i in range(2):
+                        c = cen + i * utt_num
+                        for j in range(utt_num):
+                            adj[c][i*utt_num+j] = 1
+
+                else:
+                    adj = torch.zeros((utt_num, utt_num), dtype=int)
+                    for i, row in enumerate(adj):
+                        for j, col in enumerate(row):
+                            if abs(i-j) <= self.z:
+                                adj[i][j] = 1
+                    cen = utt_num // 2
+                    for i in range(1):
+                        c = cen + i * utt_num
+                        for j in range(utt_num):
+                            adj[c][i*utt_num+j] = 1
+
+        else:
+            if self.mode == 't+v':
+                if self.task == 's+e':
+                    adj = torch.zeros((utt_num, utt_num), dtype=int)
+                    for i, row in enumerate(adj):
+                        for j, col in enumerate(row):
+                            if abs(i-j) <= self.z:
+                                adj[i][j] = 1
+
+                    adj1 = torch.cat([adj, adj, adj, torch.zeros_like(adj)], dim=0)
+                    adj2 = torch.cat([adj, adj, torch.zeros_like(adj), adj], dim=0)
+                    adj3 = torch.cat([adj, torch.zeros_like(adj), adj, adj], dim=0)
+                    adj4 = torch.cat([torch.zeros_like(adj), adj, adj, adj], dim=0)
+                    adj = torch.cat([adj1, adj2, adj3, adj4], dim=1)
+
+                    cen = utt_num // 2
+                    for i in range(4):
+                        c = cen + i * utt_num
+                        for j in range(utt_num):
+                            adj[c][i*utt_num+j] = 1
+
+                    adj = torch.cat([torch.cat([adj, torch.zeros((4*utt_num, 16*sp_num), dtype=int)], dim=1), torch.zeros((16*sp_num, 4*utt_num+16*sp_num), dtype=int)], dim=0)
+                    # connect to speaker node
+                    for row in range(4*utt_num):
+                        utt_idx = row % utt_num
+                        sp_idx = utt_sp_idx[utt_idx]
+                        adj[row][4*utt_num + 4*sp_num*(row // utt_num) + 4*sp_idx] = 1
+                        adj[4*utt_num + 4*sp_num*(row // utt_num) + 4*sp_idx][row] = 1
+                    # speaker, job, sex, personality node connect to each other
+                    for idx in range(4*sp_num):
+                        row = 4 * utt_num + 4 * idx
+                        for i in range(4):
+                            for j in range(4):
+                                adj[row+i][row+j] = 1
+
+                else:
+                    adj = torch.zeros((utt_num, utt_num), dtype=int)
+                    for i, row in enumerate(adj):
+                        for j, col in enumerate(row):
+                            if abs(i-j) <= self.z:
+                                adj[i][j] = 1
+                    adj1 = torch.cat([adj, adj], dim=0)
+                    adj2 = torch.cat([adj, adj], dim=0)
+                    adj = torch.cat([adj1, adj2], dim=1)
+                    cen = utt_num // 2
+                    for i in range(2):
+                        c = cen + i * utt_num
+                        for j in range(utt_num):
+                            adj[c][i*utt_num+j] = 1
+
+                    adj = torch.cat([torch.cat([adj, torch.zeros((2*utt_num, 8*sp_num), dtype=int)], dim=1), torch.zeros((8*sp_num, 2*utt_num+8*sp_num), dtype=int)], dim=0)
+                    # connect to speaker node
+                    for row in range(2*utt_num):
+                        utt_idx = row % utt_num
+                        sp_idx = utt_sp_idx[utt_idx]
+                        adj[row][2*utt_num + 4*sp_num*(row // utt_num) + 4*sp_idx] = 1
+                        adj[2*utt_num + 4*sp_num*(row // utt_num) + 4*sp_idx][row] = 1
+                    # speaker, job, sex, personality node connect to each other
+                    for idx in range(2*sp_num):
+                        row = 2 * utt_num + 4 * idx
+                        for i in range(4):
+                            for j in range(4):
+                                adj[row+i][row+j] = 1
+
+            else:
+                if self.task == 's+e':
+                    adj = torch.zeros((utt_num, utt_num), dtype=int)
+                    for i, row in enumerate(adj):
+                        for j, col in enumerate(row):
+                            if abs(i-j) <= self.z:
+                                adj[i][j] = 1
+                    adj1 = torch.cat([adj, adj], dim=0)
+                    adj2 = torch.cat([adj, adj], dim=0)
+                    adj = torch.cat([adj1, adj2], dim=1)
+                    cen = utt_num // 2
+                    for i in range(2):
+                        c = cen + i * utt_num
+                        for j in range(utt_num):
+                            adj[c][i*utt_num+j] = 1
+
+                    adj = torch.cat([torch.cat([adj, torch.zeros((2*utt_num, 8*sp_num), dtype=int)], dim=1), torch.zeros((8*sp_num, 2*utt_num+8*sp_num), dtype=int)], dim=0)
+                    # connect to speaker node
+                    for row in range(2*utt_num):
+                        utt_idx = row % utt_num
+                        sp_idx = utt_sp_idx[utt_idx]
+                        adj[row][2*utt_num + 4*sp_num*(row // utt_num) + 4*sp_idx] = 1
+                        adj[2*utt_num + 4*sp_num*(row // utt_num) + 4*sp_idx][row] = 1
+                    # speaker, job, sex, personality node connect to each other
+                    for idx in range(2*sp_num):
+                        row = 2 * utt_num + 4 * idx
+                        for i in range(4):
+                            for j in range(4):
+                                adj[row+i][row+j] = 1
+
+                else:
+                    adj = torch.zeros((utt_num, utt_num), dtype=int)
+                    for i, row in enumerate(adj):
+                        for j, col in enumerate(row):
+                            if abs(i-j) <= self.z:
+                                adj[i][j] = 1
+                    cen = utt_num // 2
+                    for i in range(1):
+                        c = cen + i * utt_num
+                        for j in range(utt_num):
+                            adj[c][i*utt_num+j] = 1
+
+                    adj = torch.cat([torch.cat([adj, torch.zeros((utt_num, 4*sp_num), dtype=int)], dim=1), torch.zeros((4*sp_num, utt_num+4*sp_num), dtype=int)], dim=0)
+                    # connect to speaker node
+                    for row in range(utt_num):
+                        sp_idx = utt_sp_idx[row]
+                        adj[row][utt_num + 4*sp_idx] = 1
+                        adj[utt_num + 4*sp_idx][row] = 1
+                    # speaker, job, sex, personality node connect to each other
+                    for idx in range(sp_num):
+                        row = utt_num + 4 * idx
+                        for i in range(4):
+                            for j in range(4):
+                                adj[row+i][row+j] = 1
+        return adj
 
 
 class ConGAT(nn.Module):
@@ -637,5 +719,4 @@ class ConGAT(nn.Module):
         x = torch.cat([att(x, adj) for att in self.attentions], dim=-1)
         x = self.dropout(x)
         x = F.elu(self.out_att(x, adj), inplace=True)
-
         return input_x + x
